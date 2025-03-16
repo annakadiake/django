@@ -1,6 +1,8 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 class User(AbstractUser):
     ROLE_CHOICES = (
@@ -51,6 +53,25 @@ class User(AbstractUser):
         elif completion_rate >= 90:
             return 30000
         return 0
+    
+    def get_overdue_tasks(self):
+        """Retourne les tâches en retard pour l'utilisateur"""
+        now = timezone.now()
+        return Task.objects.filter(
+            assigned_to=self,
+            status__in=['TODO', 'IN_PROGRESS'],
+            due_date__lt=now
+        )
+    
+    def get_upcoming_tasks(self, days=7):
+        """Retourne les tâches à venir dans les prochains jours"""
+        now = timezone.now()
+        deadline = now + timezone.timedelta(days=days)
+        return Task.objects.filter(
+            assigned_to=self,
+            status__in=['TODO', 'IN_PROGRESS'],
+            due_date__range=[now, deadline]
+        )
 
 
 class Project(models.Model):
@@ -66,6 +87,18 @@ class Project(models.Model):
     
     def user_is_creator(self, user):
         return self.creator == user
+    
+    def get_completed_task_count(self):
+        """Retourne le nombre de tâches terminées dans le projet"""
+        return self.tasks.filter(status='COMPLETED').count()
+    
+    def get_completion_percentage(self):
+        """Retourne le pourcentage de complétion du projet"""
+        total_tasks = self.tasks.count()
+        if total_tasks == 0:
+            return 0
+        completed_tasks = self.get_completed_task_count()
+        return (completed_tasks / total_tasks) * 100
 
 
 class Task(models.Model):
@@ -85,6 +118,7 @@ class Task(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     due_date = models.DateTimeField()
     completion_date = models.DateTimeField(null=True, blank=True)
+    priority = models.IntegerField(default=0, help_text="Plus la valeur est élevée, plus la priorité est importante")
     
     def __str__(self):
         return self.title
@@ -98,6 +132,19 @@ class Task(models.Model):
         if self.status != 'COMPLETED' or not self.completion_date:
             return False
         return self.completion_date <= self.due_date
+    
+    def is_overdue(self):
+        """Vérifie si la tâche est en retard"""
+        if self.status == 'COMPLETED':
+            return False
+        return timezone.now() > self.due_date
+    
+    def days_until_due(self):
+        """Retourne le nombre de jours avant l'échéance"""
+        if self.status == 'COMPLETED':
+            return 0
+        delta = self.due_date - timezone.now()
+        return max(0, delta.days)
 
 
 class TaskStatistics(models.Model):
@@ -154,3 +201,58 @@ class TaskStatistics(models.Model):
         
         stats.save()
         return stats
+
+
+class Notification(models.Model):
+    TYPE_CHOICES = (
+        ('TASK_ASSIGNED', 'Tâche assignée'),
+        ('TASK_DUE_SOON', 'Tâche bientôt à échéance'),
+        ('TASK_OVERDUE', 'Tâche en retard'),
+        ('TASK_COMPLETED', 'Tâche terminée'),
+        ('PROJECT_INVITATION', 'Invitation à un projet'),
+    )
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=200)
+    message = models.TextField()
+    related_task = models.ForeignKey(Task, on_delete=models.CASCADE, null=True, blank=True, related_name='notifications')
+    related_project = models.ForeignKey(Project, on_delete=models.CASCADE, null=True, blank=True, related_name='notifications')
+    created_at = models.DateTimeField(auto_now_add=True)
+    read = models.BooleanField(default=False)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.title} pour {self.user.username}"
+    
+    def mark_as_read(self):
+        self.read = True
+        self.save()
+
+
+@receiver(post_save, sender=Task)
+def create_task_notifications(sender, instance, created, **kwargs):
+    """Crée des notifications lorsqu'une tâche est créée ou modifiée"""
+    if created:
+        # Notification pour l'assignation d'une nouvelle tâche
+        Notification.objects.create(
+            user=instance.assigned_to,
+            type='TASK_ASSIGNED',
+            title='Nouvelle tâche assignée',
+            message=f'Vous avez été assigné à la tâche "{instance.title}" dans le projet "{instance.project.title}".',
+            related_task=instance,
+            related_project=instance.project
+        )
+    
+    # Si la tâche est marquée comme terminée, notifier le créateur
+    elif instance.status == 'COMPLETED' and instance.completion_date and instance.created_by != instance.assigned_to:
+        Notification.objects.create(
+            user=instance.created_by,
+            type='TASK_COMPLETED',
+            title='Tâche terminée',
+            message=f'La tâche "{instance.title}" a été marquée comme terminée par {instance.assigned_to.username}.',
+            related_task=instance,
+            related_project=instance.project
+        )
